@@ -1,571 +1,614 @@
-"""Video Thumbnail Picker — Dialog Widgets"""
+"""Modal dialogs: weights editor, shortcut help, contact sheet export, about.
 
+All secondary UI that doesn't belong in the main window lives here.
+"""
 from __future__ import annotations
 
-import math
+from typing import Dict, List, Optional
+
 import cv2
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QTimer
-from PyQt6.QtGui import (
-    QPixmap, QImage, QPainter, QColor, QFont, QPen,
-    QKeySequence, QShortcut,
-)
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QComboBox, QSlider, QCheckBox,
-    QFileDialog, QDialog, QLineEdit, QApplication,
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider, QSpinBox,
+    QScrollArea, QWidget, QGridLayout, QDialogButtonBox, QFileDialog,
+    QMessageBox, QGroupBox, QCheckBox, QComboBox, QLineEdit,
 )
 
-from VideoThumbnailPicker.old.scoring import (
-    C_BG, C_SURFACE, C_CARD, C_OVERLAY, C_TEXT, C_SUBTEXT,
-    C_BLUE, C_GREEN, C_YELLOW, C_PEACH, C_RED, C_TEAL, C_LAVENDER,
-    C_MAUVE, WEIGHTS_DEFAULT, CRIT_LABELS,
-    Candidate,
+from config import (
+    CRIT_LABELS, ALGORITHM_PROFILES,
+    C_TEXT, C_SUBTEXT, C_CARD, C_OVERLAY, C_SURFACE, C_GREEN, C_BLUE,
+    C_LAVENDER, C_BG, C_YELLOW, C_PEACH,
 )
-
-from VideoThumbnailPicker.old.widgets import _resize_cover, _resize_fit, _fmt_time
-
-
-class ComparisonOverlay(QWidget):
-    """Split-view comparing two candidates side by side with blend slider."""
-    closed = pyqtSignal()
-
-    def __init__(self, cands, indices, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
-        self._cands = cands
-        self._indices = indices
-        self._blend = 0.5  # 0 = left only, 1 = right only
-        self._dragging = False
-        self.setMouseTracking(True)
-        self._cached_left = None
-        self._cached_right = None
-
-    def show_comparison(self):
-        w, h = 1000, 660
-        self.setGeometry(80, 80, w, h)
-        # Pre-render
-        if len(self._indices) > 0:
-            self._cached_left = self._render_cand(self._indices[0], w, h)
-        if len(self._indices) > 1:
-            self._cached_right = self._render_cand(self._indices[1], w, h)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def _render_cand(self, idx, w, h):
-        c = self._cands[idx]
-        rgb = cv2.cvtColor(c.frame_bgr, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
-        pil = _resize_cover(pil, w, h)
-        return pil
-
-    def paintEvent(self, e):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothTransformation)
-        w, h = self.width(), self.height()
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 220))
-
-        if self._cached_left:
-            pw, ph = self._cached_left.size
-            qi = QImage(self._cached_left.tobytes(), pw, ph, 3 * pw,
-                        QImage.Format.Format_RGB888)
-            if self._blend < 1.0:
-                painter.setOpacity(1.0)
-                painter.drawImage(QRect(0, 0, w, h), qi)
-        if self._cached_right:
-            pw, ph = self._cached_right.size
-            qi = QImage(self._cached_right.tobytes(), pw, ph, 3 * pw,
-                        QImage.Format.Format_RGB888)
-            painter.setOpacity(self._blend)
-            painter.drawImage(QRect(0, 0, w, h), qi)
-
-        painter.setOpacity(1.0)
-
-        # Divider line
-        sx = int(w * self._blend)
-        painter.setPen(QPen(QColor(255, 255, 255, 180), 2, Qt.PenStyle.DashLine))
-        painter.drawLine(sx, 0, sx, h)
-
-        # Instructions
-        painter.setPen(QColor(255, 255, 255, 180))
-        painter.setFont(QFont("Segoe UI", 10))
-        painter.drawText(10, 22,
-                         "Drag to blend  \u00b7  S = swap  \u00b7  "
-                         "ESC to close")
-
-        # Scores
-        painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        if len(self._indices) > 0:
-            s = self._cands[self._indices[0]].total_score
-            painter.setPen(QColor(255, 255, 255, 220))
-            painter.drawText(10, h - 50,
-                             f"#{self._indices[0] + 1}  score: {s:.3f}")
-        if len(self._indices) > 1:
-            s = self._cands[self._indices[1]].total_score
-            painter.setPen(QColor(255, 255, 255, 220))
-            painter.drawText(10, h - 25,
-                             f"#{self._indices[1] + 1}  score: {s:.3f}")
-
-        # Blend percentage
-        painter.setPen(QColor(255, 255, 255, 150))
-        painter.setFont(QFont("Consolas", 10))
-        painter.drawText(w - 80, 22, f"{self._blend * 100:.0f}%")
-
-        painter.end()
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._blend = max(0, min(1, e.pos().x() / self.width()))
-            self.update()
-
-    def mouseMoveEvent(self, e):
-        if self._dragging:
-            self._blend = max(0, min(1, e.pos().x() / self.width()))
-            self.update()
-
-    def mouseReleaseEvent(self, e):
-        self._dragging = False
-
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape:
-            self.close()
-            self.closed.emit()
-        elif e.key() == Qt.Key.Key_S:
-            # Swap
-            if len(self._indices) >= 2:
-                self._indices[0], self._indices[1] = (
-                    self._indices[1], self._indices[0])
-                self._cached_left, self._cached_right = (
-                    self._cached_right, self._cached_left)
-                self._blend = 1.0 - self._blend
-                self.update()
-
-# ────────────────────────────────────────────────────────────────────────────
-# Save dialog with quality slider
-# ────────────────────────────────────────────────────────────────────────────
-
-class SaveDialog(QDialog):
-    def __init__(self, parent=None, default_name="", default_dir=""):
-        super().__init__(parent)
-        self.setWindowTitle("Save Thumbnail")
-        self.setMinimumWidth(420)
-        self.setStyleSheet(
-            f"QDialog{{background:{C_SURFACE};}}"
-            f"QLabel{{color:{C_TEXT};}}"
-            f"QPushButton{{background:{C_OVERLAY};color:{C_TEXT};"
-            f"border:none;border-radius:6px;padding:8px 16px;}}"
-            f"QPushButton:hover{{background:{C_BLUE};color:{C_BG};}}")
-
-        lay = QVBoxLayout(self)
-        lay.setSpacing(12)
-
-        # File path
-        path_row = QHBoxLayout()
-        path_row.addWidget(QLabel("File:"))
-        self.path_edit = QLineEdit(default_name)
-        self.path_edit.setStyleSheet(
-            f"background:{C_CARD};color:{C_TEXT};border:1px solid {C_OVERLAY};"
-            f"border-radius:4px;padding:6px;")
-        path_row.addWidget(self.path_edit, stretch=1)
-        btn_browse = QPushButton("Browse...")
-        btn_browse.setFixedWidth(80)
-        btn_browse.clicked.connect(self._browse)
-        path_row.addWidget(btn_browse)
-        lay.addLayout(path_row)
-
-        # Format
-        fmt_row = QHBoxLayout()
-        fmt_row.addWidget(QLabel("Format:"))
-        self.combo_fmt = QComboBox()
-        self.combo_fmt.addItems(["JPEG", "PNG", "WebP"])
-        self.combo_fmt.currentTextChanged.connect(self._on_fmt)
-        fmt_row.addWidget(self.combo_fmt)
-        fmt_row.addStretch()
-        lay.addLayout(fmt_row)
-
-        # Quality
-        q_row = QHBoxLayout()
-        q_row.addWidget(QLabel("Quality:"))
-        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
-        self.quality_slider.setRange(10, 100)
-        self.quality_slider.setValue(95)
-        q_row.addWidget(self.quality_slider, stretch=1)
-        self.quality_label = QLabel("95%")
-        self.quality_label.setFixedWidth(40)
-        self.quality_slider.valueChanged.connect(
-            lambda v: self.quality_label.setText(f"{v}%"))
-        q_row.addWidget(self.quality_label)
-        lay.addLayout(q_row)
-
-        self.quality_note = QLabel(
-            "Quality affects file size. 95% is near-lossless JPEG.")
-        self.quality_note.setStyleSheet(f"font-size:10px;color:{C_SUBTEXT};")
-        lay.addWidget(self.quality_note)
-
-        # Watermark
-        self.chk_watermark = QCheckBox("Add timestamp watermark")
-        lay.addWidget(self.chk_watermark)
-
-        # Buttons
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_ok = QPushButton("Save")
-        btn_ok.setObjectName("btnGreen")
-        btn_ok.clicked.connect(self.accept)
-        btn_row.addWidget(btn_ok)
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        btn_row.addWidget(btn_cancel)
-        lay.addLayout(btn_row)
-
-        self._default_dir = default_dir
-
-    def _browse(self):
-        fmt = self.combo_fmt.currentText().lower()
-        ext_map = {"jpeg": ".jpg", "png": ".png", "webp": ".webp"}
-        ext = ext_map.get(fmt, ".jpg")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save", self.path_edit.text(),
-            f"{fmt.upper()} (*{ext});;All (*)")
-        if path:
-            self.path_edit.setText(path)
-
-    def _on_fmt(self, fmt):
-        is_lossless = fmt in ("PNG",)
-        self.quality_slider.setEnabled(not is_lossless)
-        self.quality_note.setText(
-            "PNG is lossless \u2014 quality slider disabled."
-            if is_lossless else
-            "Quality affects file size. 95% is near-lossless JPEG.")
-
-    def get_values(self):
-        return (
-            self.path_edit.text(),
-            self.combo_fmt.currentText(),
-            self.quality_slider.value(),
-            self.chk_watermark.isChecked(),
-        )
+from analysis import Candidate
+from utils import format_time
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Video scrubber dialog
+# Algorithm weights editor
 # ────────────────────────────────────────────────────────────────────────────
+class WeightsEditorDialog(QDialog):
+    """Edit algorithm weights with live normalization preview.
 
-class VideoScrubberDialog(QDialog):
-    """Dialog with a slider to seek to any frame in the video."""
-    frame_selected = pyqtSignal(float)  # timestamp
-
-    def __init__(self, video_path, video_info, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Video Scrubber")
-        self.setMinimumWidth(700)
-        self.setMinimumHeight(300)
-        self.video_path = video_path
-        self.info = video_info
-        self.duration = video_info.get("duration", 10)
-        self.setStyleSheet(
-            f"QDialog{{background:{C_SURFACE};}}"
-            f"QLabel{{color:{C_TEXT};}}"
-            f"QPushButton{{background:{C_OVERLAY};color:{C_TEXT};"
-            f"border:none;border-radius:6px;padding:8px 16px;}}"
-            f"QPushButton:hover{{background:{C_BLUE};color:{C_BG};}}")
-
-        lay = QVBoxLayout(self)
-        lay.setSpacing(8)
-
-        # Preview
-        self.preview_label = QLabel()
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumHeight(250)
-        self.preview_label.setStyleSheet(
-            f"background:{C_CARD};border-radius:8px;")
-        lay.addWidget(self.preview_label, stretch=1)
-
-        # Time label
-        self.time_label = QLabel("00:00.000 / --:--")
-        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.time_label.setStyleSheet(
-            f"font-size:13px;color:{C_GREEN};font-family:Consolas,monospace;")
-        lay.addWidget(self.time_label)
-
-        # Slider
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(0, int(self.duration * 1000))
-        self.slider.setValue(0)
-        self.slider.valueChanged.connect(self._on_seek)
-        lay.addWidget(self.slider)
-
-        # Buttons
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_select = QPushButton("Use this frame")
-        btn_select.setObjectName("btnGreen")
-        btn_select.clicked.connect(self._select)
-        btn_row.addWidget(btn_select)
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        btn_row.addWidget(btn_cancel)
-        lay.addLayout(btn_row)
-
-        self._cap = cv2.VideoCapture(video_path)
-        self._on_seek(0)
-
-    def _on_seek(self, ms):
-        if self._cap is None or not self._cap.isOpened():
-            return
-        self._cap.set(cv2.CAP_PROP_POS_MSEC, ms)
-        ret, frame = self._cap.read()
-        if ret:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w = frame.shape[:2]
-            qi = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-            pm = QPixmap.fromImage(qi).scaled(
-                680, 240, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation)
-            self.preview_label.setPixmap(pm)
-
-        t = ms / 1000
-        mm, ss = divmod(int(t), 60)
-        ms_rem = int((t % 1) * 1000)
-        total_mm, total_ss = divmod(int(self.duration), 60)
-        self.time_label.setText(
-            f"{mm:02d}:{ss:02d}.{ms_rem:03d} / "
-            f"{total_mm:02d}:{total_ss:02d}")
-
-    def _select(self):
-        t = self.slider.value() / 1000
-        self.frame_selected.emit(t)
-        self.accept()
-
-    def closeEvent(self, e):
-        if self._cap:
-            self._cap.release()
-        super().closeEvent(e)
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Thumbnail Viewer — fullscreen slideshow with arrow cycling
-# ────────────────────────────────────────────────────────────────────────────
-
-class ThumbnailViewer(QWidget):
-    """Fullscreen-capable thumbnail viewer.
-    Shows one candidate at a time;  ← →  cycle,  Home/End  jump,
-    S  save,  F11  fullscreen toggle,  ESC  close.
+    Sliders are 0–100 (display); actual weights are normalised to sum to 1.0.
+    The user can save the result as a new (or overwrite an existing) custom
+    profile.
     """
 
-    closed = pyqtSignal(int)          # emits the index being viewed
-    save_requested = pyqtSignal(int)  # index to save
-
-    def __init__(self, candidates: list[Candidate], start_idx=0, parent=None):
+    def __init__(self, parent, profile_name: str, weights: Dict[str, float],
+                 existing_profiles: List[str]) -> None:
         super().__init__(parent)
-        self._cands = candidates
-        self._idx = start_idx
-        self._is_fullscreen = False
-        self._labels: list[QLabel] = []  # thin labels drawn via paintEvent
+        self.setWindowTitle("Edit Algorithm Profile")
+        self.setMinimumWidth(520)
+        self._initial_weights = dict(weights)
 
-        self.setWindowFlags(
-            Qt.WindowType.Window | Qt.WindowType.WindowCloseButtonHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        self.setMinimumSize(900, 600)
-        self.resize(1200, 750)
-        self.setWindowTitle("Thumbnail Viewer")
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setStyleSheet(f"background:{C_BG};")
+        v = QVBoxLayout(self)
+        v.setSpacing(10)
 
-        # ── layout ──
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        # ── Profile name row ──
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Profile name:"))
+        self.name_edit = QLineEdit(profile_name)
+        self.name_edit.setStyleSheet("padding: 4px 6px;")
+        row.addWidget(self.name_edit, stretch=1)
+        v.addLayout(row)
 
-        # Image label (fills available space)
-        self._img_lbl = QLabel()
-        self._img_lbl.setAlignment(
-            Qt.AlignmentFlag.AlignCenter)
-        self._img_lbl.setStyleSheet(f"background:{C_BG};")
-        root.addWidget(self._img_lbl, stretch=1)
+        # ── Hint ──
+        hint = QLabel(
+            "Drag the sliders to adjust each criterion's weight. "
+            "Weights are normalised to sum to 1.0. A zero-weight criterion "
+            "is excluded entirely."
+        )
+        hint.setStyleSheet(f"color:{C_SUBTEXT}; font-size:11px;")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
 
-        # ── Bottom info bar ──
-        bar = QWidget()
-        bar.setFixedHeight(72)
-        bar.setStyleSheet(
-            f"background:{C_SURFACE};border-top:1px solid {C_OVERLAY};")
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(16, 6, 16, 6)
-        bl.setSpacing(16)
+        # ── Sliders ──
+        sliders_box = QGroupBox("Criteria Weights")
+        sgrid = QGridLayout(sliders_box)
+        sgrid.setContentsMargins(12, 16, 12, 12)
+        sgrid.setHorizontalSpacing(10)
+        sgrid.setVerticalSpacing(6)
+        self._sliders: Dict[str, QSlider] = {}
+        self._value_labels: Dict[str, QLabel] = {}
 
-        self._lbl_rank = QLabel()
-        self._lbl_rank.setFixedWidth(60)
-        bl.addWidget(self._lbl_rank)
+        for i, key in enumerate(sorted(CRIT_LABELS.keys())):
+            label = QLabel(CRIT_LABELS[key])
+            label.setMinimumWidth(70)
+            sgrid.addWidget(label, i, 0)
 
-        self._lbl_time = QLabel()
-        self._lbl_time.setFixedWidth(90)
-        bl.addWidget(self._lbl_time)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(int(round(weights.get(key, 0.0) * 100)))
+            slider.valueChanged.connect(self._on_changed)
+            sgrid.addWidget(slider, i, 1)
+            self._sliders[key] = slider
 
-        self._lbl_score = QLabel()
-        self._lbl_score.setFixedWidth(120)
-        bl.addWidget(self._lbl_score)
+            val_lbl = QLabel(f"{weights.get(key, 0.0):.2f}")
+            val_lbl.setMinimumWidth(40)
+            val_lbl.setStyleSheet(
+                f"font-family:'JetBrains Mono','Consolas',monospace; color:{C_GREEN};"
+            )
+            sgrid.addWidget(val_lbl, i, 2)
+            self._value_labels[key] = val_lbl
 
-        # Mini score breakdown bar
-        self._bar_widget = _ViewerScoreBar()
-        self._bar_widget.setFixedSize(220, 18)
-        bl.addWidget(self._bar_widget)
+        v.addWidget(sliders_box)
 
-        bl.addStretch()
+        # ── Summary ──
+        self.summary_lbl = QLabel()
+        self.summary_lbl.setStyleSheet(f"color:{C_SUBTEXT}; font-size:11px;")
+        v.addWidget(self.summary_lbl)
 
-        # Navigation hints
-        hint = QLabel("← →  Cycle   ·   Home/End   ·   S  Save   ·   F11  Fullscreen   ·   ESC  Close")
-        hint.setStyleSheet(f"font-size:10px;color:{C_SUBTEXT};")
-        bl.addWidget(hint)
+        # ── Buttons ──
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
 
-        root.addWidget(bar)
+        reset_btn = QPushButton("Reset to Original")
+        reset_btn.clicked.connect(self._reset)
+        btns.addButton(reset_btn, QDialogButtonBox.ButtonRole.ResetRole)
 
-        # ── Shortcuts (local to this widget) ──
-        QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self._nav(-1))
-        QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self._nav(1))
-        QShortcut(QKeySequence(Qt.Key.Key_Up), self, lambda: self._nav(-5))
-        QShortcut(QKeySequence(Qt.Key.Key_Down), self, lambda: self._nav(5))
-        QShortcut(QKeySequence(Qt.Key.Key_Home), self, lambda: self._go(0))
-        QShortcut(QKeySequence(Qt.Key.Key_End), self, lambda: self._go(len(self._cands) - 1))
-        QShortcut(QKeySequence("S"), self, self._on_save)
-        QShortcut(QKeySequence("F11"), self, self._toggle_fullscreen)
-        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self._close_self)
+        v.addWidget(btns)
+        self._on_changed()
 
-        self._refresh()
+    def _on_changed(self, *_) -> None:
+        weights = self.get_weights()
+        for key, slider in self._sliders.items():
+            w = weights.get(key, 0.0)
+            self._value_labels[key].setText(f"{w:.2f}")
+        total = sum(weights.values())
+        active = sum(1 for val in weights.values() if val > 0)
+        self.summary_lbl.setText(
+            f"Normalised sum: {total:.3f}  |  Active criteria: {active}/{len(self._sliders)}"
+        )
 
-    # ── navigation ──
+    def _reset(self) -> None:
+        for key, slider in self._sliders.items():
+            slider.setValue(int(round(self._initial_weights.get(key, 0.0) * 100)))
 
-    def _nav(self, d):
-        n = len(self._cands)
-        if n == 0:
-            return
-        self._idx = (self._idx + d) % n
-        self._refresh()
+    def get_weights(self) -> Dict[str, float]:
+        """Return normalised weights (sum to 1.0)."""
+        raw = {k: s.value() / 100.0 for k, s in self._sliders.items() if s.value() > 0}
+        total = sum(raw.values())
+        if total == 0:
+            # All zero — fall back to uniform
+            return {k: 1.0 / len(self._sliders) for k in self._sliders}
+        return {k: v / total for k, v in raw.items()}
 
-    def _go(self, idx):
-        idx = max(0, min(idx, len(self._cands) - 1))
-        self._idx = idx
-        self._refresh()
-
-    def _on_save(self):
-        if self._cands:
-            self.save_requested.emit(self._idx)
-
-    def _close_self(self):
-        self.closed.emit(self._idx)
-        self.close()
-
-    # ── display ──
-
-    def _refresh(self):
-        if not self._cands:
-            self._img_lbl.setText("No candidates")
-            return
-
-        c = self._cands[self._idx]
-        rgb = cv2.cvtColor(c.frame_bgr, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
-
-        # Fit to the label size while preserving aspect ratio
-        lbl_w = self._img_lbl.width() or 1100
-        lbl_h = self._img_lbl.height() or 600
-        pil = _resize_fit(pil, lbl_w - 16, lbl_h - 16)
-        pw, ph = pil.size
-        qi = QImage(pil.tobytes(), pw, ph, 3 * pw,
-                    QImage.Format.Format_RGB888)
-        self._img_lbl.setPixmap(QPixmap.fromImage(qi))
-
-        # Update info bar
-        n = len(self._cands)
-        star = " ★" if c.starred else ""
-        self._lbl_rank.setText(
-            f"<b style='font-size:16px;color:{C_LAVENDER};'>"
-            f"#{self._idx + 1}/{n}</b>{star}")
-        self._lbl_rank.setStyleSheet(f"background:transparent;")
-
-        self._lbl_time.setText(
-            f"<span style='font-size:12px;color:{C_GREEN};"
-            f"font-family:Consolas,monospace;'>"
-            f"{_fmt_time(c.timestamp)}</span>")
-        self._lbl_time.setStyleSheet(f"background:transparent;")
-
-        self._lbl_score.setText(
-            f"<span style='font-size:12px;color:{C_TEXT};'>"
-            f"Score: <b>{c.total_score:.3f}</b></span>")
-        self._lbl_score.setStyleSheet(f"background:transparent;")
-
-        self._bar_widget.set_breakdown(c.breakdown)
-
-        self.setWindowTitle(
-            f"Thumbnail Viewer  —  #{self._idx + 1} of {n}")
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        # Re-render image to fill new size
-        if self._cands:
-            self._refresh()
-
-    def keyPressEvent(self, e):
-        # Handled by shortcuts; ignore other keys
-        pass
-
-    # ── fullscreen ──
-
-    def _toggle_fullscreen(self):
-        if self._is_fullscreen:
-            self.showNormal()
-        else:
-            self.showFullScreen()
-        self._is_fullscreen = not self._is_fullscreen
+    def get_profile_name(self) -> str:
+        return self.name_edit.text().strip() or "Custom Profile"
 
 
-class _ViewerScoreBar(QWidget):
-    """Tiny horizontal score-breakdown bar for the viewer."""
+# ────────────────────────────────────────────────────────────────────────────
+# Keyboard shortcut help
+# ────────────────────────────────────────────────────────────────────────────
+class ShortcutHelpDialog(QDialog):
+    """Show keyboard shortcuts grouped by category."""
 
-    def __init__(self, parent=None):
+    SHORTCUTS: List[tuple] = [
+        ("File", [
+            ("Ctrl+O",          "Open video file"),
+            ("Ctrl+S",          "Save selected frame"),
+            ("Ctrl+Shift+S",    "Save all starred frames"),
+            ("Ctrl+E",          "Export contact sheet"),
+            ("Ctrl+Q",          "Quit"),
+        ]),
+        ("Navigation", [
+            ("← / →",           "Previous / next candidate"),
+            ("F2",              "Fit image to view"),
+            ("Ctrl+= / Ctrl+-", "Zoom in / out"),
+            ("Ctrl+0",          "Reset zoom to 100%"),
+        ]),
+        ("Overlays", [
+            ("G",               "Toggle rule-of-thirds grid"),
+            ("F",               "Toggle face-detection overlay"),
+        ]),
+        ("Analysis", [
+            ("Space",           "Run / stop analysis"),
+            ("Esc",             "Stop analysis"),
+            ("F1",              "Show this help"),
+        ]),
+        ("Gallery", [
+            ("S",               "Star / unstar current candidate"),
+            ("R",               "Re-analyze around current frame"),
+        ]),
+    ]
+
+    def __init__(self, parent) -> None:
         super().__init__(parent)
-        self._breakdown: dict = {}
-        self.setFixedHeight(18)
+        self.setWindowTitle("Keyboard Shortcuts")
+        self.setMinimumWidth(460)
 
-    def set_breakdown(self, bd: dict):
-        self._breakdown = bd
-        self.update()
+        v = QVBoxLayout(self)
+        v.setSpacing(10)
 
-    def paintEvent(self, e):
-        if not self._breakdown:
+        title = QLabel("Keyboard Shortcuts")
+        title.setStyleSheet(f"font-size:15px; font-weight:bold; color:{C_LAVENDER};")
+        v.addWidget(title)
+
+        for section_name, items in self.SHORTCUTS:
+            group = QGroupBox(section_name)
+            gl = QGridLayout(group)
+            gl.setContentsMargins(12, 14, 12, 12)
+            gl.setHorizontalSpacing(16)
+            gl.setVerticalSpacing(4)
+            for i, (key, desc) in enumerate(items):
+                k_lbl = QLabel(key)
+                k_lbl.setStyleSheet(
+                    f"color:{C_LAVENDER}; font-family:'JetBrains Mono','Consolas',monospace; "
+                    f"font-weight:bold; font-size:11px;"
+                )
+                gl.addWidget(k_lbl, i, 0)
+                d_lbl = QLabel(desc)
+                d_lbl.setStyleSheet(f"color:{C_TEXT};")
+                gl.addWidget(d_lbl, i, 1)
+            v.addWidget(group)
+
+        btn = QPushButton("Close")
+        btn.setObjectName("btnPrimary")
+        btn.clicked.connect(self.accept)
+        v.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# About dialog
+# ────────────────────────────────────────────────────────────────────────────
+class AboutDialog(QDialog):
+    """Simple about / credits dialog."""
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("About")
+        self.setMinimumWidth(380)
+
+        v = QVBoxLayout(self)
+        v.setSpacing(10)
+        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title = QLabel("Video Thumbnail Picker")
+        title.setStyleSheet(f"font-size:18px; font-weight:bold; color:{C_LAVENDER};")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(title)
+
+        ver = QLabel("Version 2.1")
+        ver.setStyleSheet(f"color:{C_SUBTEXT}; font-size:12px;")
+        ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(ver)
+
+        desc = QLabel(
+            "Automatically finds the best frames in a video using a\n"
+            "weighted set of image-quality metrics (sharpness, contrast,\n"
+            "faces, composition, colour, dynamic range and more).\n\n"
+            "Built with PySide6, OpenCV and Pillow."
+        )
+        desc.setStyleSheet(f"color:{C_TEXT}; font-size:11px;")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(desc)
+
+        btn = QPushButton("Close")
+        btn.clicked.connect(self.accept)
+        v.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Contact sheet export
+# ────────────────────────────────────────────────────────────────────────────
+class ContactSheetDialog(QDialog):
+    """Configure and export a contact-sheet PNG of candidates."""
+
+    def __init__(self, parent, candidates: List[Candidate], video_name: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export Contact Sheet")
+        self.setMinimumWidth(380)
+        self._candidates = candidates
+        self._video_name = video_name
+
+        v = QVBoxLayout(self)
+        v.setSpacing(10)
+
+        # ── Layout settings ──
+        box = QGroupBox("Layout")
+        gl = QGridLayout(box)
+        gl.setContentsMargins(12, 14, 12, 12)
+        gl.setHorizontalSpacing(10)
+        gl.setVerticalSpacing(6)
+
+        gl.addWidget(QLabel("Columns:"), 0, 0)
+        self.cols_spin = QSpinBox()
+        self.cols_spin.setRange(1, 10)
+        self.cols_spin.setValue(4)
+        gl.addWidget(self.cols_spin, 0, 1)
+
+        gl.addWidget(QLabel("Thumb width (px):"), 1, 0)
+        self.thumb_w_spin = QSpinBox()
+        self.thumb_w_spin.setRange(80, 480)
+        self.thumb_w_spin.setValue(240)
+        self.thumb_w_spin.setSingleStep(20)
+        gl.addWidget(self.thumb_w_spin, 1, 1)
+
+        gl.addWidget(QLabel("Thumb height (px):"), 2, 0)
+        self.thumb_h_spin = QSpinBox()
+        self.thumb_h_spin.setRange(60, 360)
+        self.thumb_h_spin.setValue(135)
+        self.thumb_h_spin.setSingleStep(15)
+        gl.addWidget(self.thumb_h_spin, 2, 1)
+
+        self.chk_labels = QCheckBox("Show labels (rank, time, score)")
+        self.chk_labels.setChecked(True)
+        gl.addWidget(self.chk_labels, 3, 0, 1, 2)
+
+        self.chk_starred_only = QCheckBox("Starred only")
+        gl.addWidget(self.chk_starred_only, 4, 0, 1, 2)
+
+        v.addWidget(box)
+
+        # ── Preview count ──
+        self.count_lbl = QLabel()
+        self.count_lbl.setStyleSheet(f"color:{C_SUBTEXT}; font-size:11px;")
+        v.addWidget(self.count_lbl)
+        self._update_count()
+
+        for sp in (self.cols_spin, self.thumb_w_spin, self.thumb_h_spin):
+            sp.valueChanged.connect(self._update_count)
+        self.chk_starred_only.stateChanged.connect(self._update_count)
+
+        # ── Buttons ──
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._export)
+        btns.rejected.connect(self.reject)
+        v.addWidget(btns)
+
+    def _update_count(self) -> None:
+        cands = self._get_selected()
+        cols = self.cols_spin.value()
+        rows = (len(cands) + cols - 1) // cols if cols else 0
+        self.count_lbl.setText(
+            f"{len(cands)} frames → {rows} rows × {cols} cols"
+        )
+
+    def _get_selected(self) -> List[Candidate]:
+        if self.chk_starred_only.isChecked():
+            return [c for c in self._candidates if c.starred]
+        return list(self._candidates)
+
+    def _export(self) -> None:
+        cands = self._get_selected()
+        if not cands:
+            QMessageBox.information(self, "No frames", "No frames to export.")
             return
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        top = sorted(self._breakdown.items(),
-                     key=lambda x: WEIGHTS_DEFAULT.get(x[0], 0),
-                     reverse=True)[:7]
-        if not top:
-            p.end()
+
+        default_name = f"contact_sheet_{self._video_name or 'thumbnails'}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Contact Sheet", default_name, "PNG (*.png)"
+        )
+        if not path:
             return
-        seg = w / len(top)
-        cols = [C_BLUE, C_GREEN, C_PEACH, C_MAUVE, C_TEAL, C_LAVENDER, C_YELLOW]
-        for i, (name, val) in enumerate(top):
-            bw = int(seg * val)
-            x = int(i * seg)
-            if bw > 0:
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(cols[i % len(cols)]))
-                p.drawRoundedRect(x + 1, 2, max(1, bw - 2), h - 4, 2, 2)
-        # Label each segment
-        p.setPen(QColor(C_TEXT))
-        p.setFont(QFont("Segoe UI", 7))
-        for i, (name, val) in enumerate(top):
-            label = CRIT_LABELS.get(name, name)
-            # Abbreviate long labels
-            if len(label) > 8:
-                label = label[:7] + "."
-            p.setPen(QColor(C_TEXT))
-            x = int(i * seg) + 4
-            y = h - 3
-            p.drawText(x, y, label)
-        p.end()
+
+        try:
+            self._generate(path, cands)
+            QMessageBox.information(self, "Exported", f"Saved contact sheet to:\n{path}")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+
+    def _generate(self, path: str, cands: List[Candidate]) -> None:
+        cols = self.cols_spin.value()
+        thumb_w = self.thumb_w_spin.value()
+        thumb_h = self.thumb_h_spin.value()
+        show_labels = self.chk_labels.isChecked()
+
+        label_h = 22 if show_labels else 0
+        cell_w = thumb_w
+        cell_h = thumb_h + label_h
+        padding = 10
+        title_h = 36
+
+        rows = (len(cands) + cols - 1) // cols
+        sheet_w = cols * cell_w + (cols + 1) * padding
+        sheet_h = rows * cell_h + (rows + 1) * padding + title_h
+
+        # Background = C_BG (#1e1e2e → (30, 30, 46))
+        sheet = Image.new("RGB", (sheet_w, sheet_h), (30, 30, 46))
+        draw = ImageDraw.Draw(sheet)
+
+        try:
+            font_title = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16
+            )
+            font_small = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11
+            )
+        except Exception:
+            font_title = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+
+        # Title bar
+        title_text = f"Contact Sheet — {self._video_name} ({len(cands)} frames)"
+        draw.text((padding, 8), title_text, fill=(205, 214, 244), font=font_title)
+
+        for i, c in enumerate(cands):
+            row = i // cols
+            col = i % cols
+            x = padding + col * (cell_w + padding)
+            y = title_h + padding + row * (cell_h + padding)
+
+            # Thumbnail
+            rgb = cv2.cvtColor(c.frame_bgr, cv2.COLOR_BGR2RGB)
+            pil_thumb = Image.fromarray(rgb).resize(
+                (thumb_w, thumb_h), Image.Resampling.LANCZOS
+            )
+            sheet.paste(pil_thumb, (x, y))
+
+            # Border
+            border_color = (249, 226, 175) if c.starred else (69, 71, 90)  # C_YELLOW / C_OVERLAY
+            draw.rectangle(
+                [(x, y), (x + thumb_w - 1, y + thumb_h - 1)],
+                outline=border_color, width=2,
+            )
+
+            # Label
+            if show_labels:
+                ly = y + thumb_h + 2
+                label = f"#{i + 1}  {format_time(c.timestamp)}  {c.total_score:.2f}"
+                draw.text((x + 2, ly), label, fill=(166, 173, 200), font=font_small)
+
+        sheet.save(path, "PNG")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Preferences dialog
+# ────────────────────────────────────────────────────────────────────────────
+class PreferencesDialog(QDialog):
+    """Edit user preferences: theme, gallery card size, filename template.
+
+    Changes are applied immediately to the parent window via callbacks
+    set with :meth:`set_callbacks`.
+    """
+
+    def __init__(self, parent, *, theme: str, card_size: str,
+                 filename_template: str, auto_free_memory: bool) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setMinimumWidth(480)
+
+        self._on_theme_change = None
+        self._on_card_size_change = None
+        self._on_template_change = None
+        self._on_auto_free_change = None
+
+        v = QVBoxLayout(self)
+        v.setSpacing(12)
+
+        # ── Appearance ──
+        app_box = QGroupBox("Appearance")
+        app_lay = QVBoxLayout(app_box)
+        app_lay.setContentsMargins(12, 16, 12, 12)
+        app_lay.setSpacing(8)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Theme:"))
+        self.combo_theme = QComboBox()
+        self.combo_theme.addItems(["dark", "light"])
+        self.combo_theme.setCurrentText(theme)
+        self.combo_theme.currentTextChanged.connect(self._on_theme_changed)
+        row1.addWidget(self.combo_theme, stretch=1)
+        app_lay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Gallery card size:"))
+        self.combo_card_size = QComboBox()
+        self.combo_card_size.addItems(["Small", "Medium", "Large"])
+        self.combo_card_size.setCurrentText(card_size)
+        self.combo_card_size.currentTextChanged.connect(self._on_card_size_changed)
+        row2.addWidget(self.combo_card_size, stretch=1)
+        app_lay.addLayout(row2)
+        v.addWidget(app_box)
+
+        # ── Save ──
+        save_box = QGroupBox("Save")
+        save_lay = QVBoxLayout(save_box)
+        save_lay.setContentsMargins(12, 16, 12, 12)
+        save_lay.setSpacing(8)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Filename template:"))
+        self.combo_template = QComboBox()
+        self.combo_template.setEditable(True)
+        self.combo_template.addItems([
+            "thumb_{timestamp}.jpg",
+            "{video}_{timestamp}.jpg",
+            "{video}_rank{rank}_{score}.jpg",
+            "{video}_{ts_seconds}s_{score}.jpg",
+            "thumbnail_{rank:02d}.jpg",
+        ])
+        self.combo_template.setCurrentText(filename_template)
+        self.combo_template.currentTextChanged.connect(self._on_template_changed)
+        row3.addWidget(self.combo_template, stretch=1)
+        save_lay.addLayout(row3)
+
+        hint = QLabel(
+            "Placeholders: {video} {timestamp} {ts_seconds} {score} {rank} {preset}\n"
+            "Example: myvideo_00:12-345_0.87.jpg"
+        )
+        hint.setStyleSheet(f"color:{C_SUBTEXT}; font-size:10px;")
+        save_lay.addWidget(hint)
+        v.addWidget(save_box)
+
+        # ── Memory ──
+        mem_box = QGroupBox("Memory")
+        mem_lay = QVBoxLayout(mem_box)
+        mem_lay.setContentsMargins(12, 16, 12, 12)
+        self.chk_auto_free = QCheckBox(
+            "Auto-free full-res frames after analysis (re-fetches on demand)"
+        )
+        self.chk_auto_free.setChecked(auto_free_memory)
+        self.chk_auto_free.setToolTip(
+            "Releases all full-resolution frames from memory once analysis "
+            "completes. Frames are re-read from the video file when needed. "
+            "Saves ~30MB per 1080p candidate."
+        )
+        self.chk_auto_free.stateChanged.connect(self._on_auto_free_changed)
+        mem_lay.addWidget(self.chk_auto_free)
+        v.addWidget(mem_box)
+
+        # ── Buttons ──
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.accept)
+        v.addWidget(btns)
+
+    # -- callbacks ---------------------------------------------------------
+    def set_callbacks(self, *, on_theme_change=None, on_card_size_change=None,
+                      on_template_change=None, on_auto_free_change=None) -> None:
+        self._on_theme_change = on_theme_change
+        self._on_card_size_change = on_card_size_change
+        self._on_template_change = on_template_change
+        self._on_auto_free_change = on_auto_free_change
+
+    def _on_theme_changed(self, theme: str) -> None:
+        if self._on_theme_change:
+            self._on_theme_change(theme)
+
+    def _on_card_size_changed(self, size: str) -> None:
+        if self._on_card_size_change:
+            self._on_card_size_change(size)
+
+    def _on_template_changed(self, template: str) -> None:
+        if self._on_template_change:
+            self._on_template_change(template)
+
+    def _on_auto_free_changed(self, state: int) -> None:
+        if self._on_auto_free_change:
+            self._on_auto_free_change(state != 0)
+
+    # -- getters -----------------------------------------------------------
+    @property
+    def theme(self) -> str: return self.combo_theme.currentText()
+    @property
+    def card_size(self) -> str: return self.combo_card_size.currentText()
+    @property
+    def filename_template(self) -> str: return self.combo_template.currentText()
+    @property
+    def auto_free_memory(self) -> bool: return self.chk_auto_free.isChecked()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Save / Load candidate list (JSON)
+# ────────────────────────────────────────────────────────────────────────────
+def save_candidates_to_json(path: str, candidates: list, video_path: str,
+                             video_info: dict) -> None:
+    """Serialise candidate metadata (no frames) to a JSON file.
+
+    The file can be re-loaded to skip re-analysis on a known video.
+    """
+    import json
+    data = {
+        "version": 1,
+        "video_path": video_path,
+        "video_info": video_info,
+        "candidates": [
+            {
+                "timestamp": round(c.timestamp, 3),
+                "total_score": round(c.total_score, 6),
+                "breakdown": {k: round(float(v), 6) for k, v in c.breakdown.items()},
+                "faces": [list(f) for f in c.faces],
+                "starred": c.starred,
+            }
+            for c in candidates
+        ],
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_candidates_from_json(path: str):
+    """Return (candidates, video_path, video_info) from a saved JSON file.
+
+    Candidates are returned as ``Candidate`` objects with ``frame_bgr=None``
+    — they will lazy-load from the video file on first access.
+    """
+    import json
+    from analysis import Candidate
+    with open(path, "r") as f:
+        data = json.load(f)
+    video_path = data.get("video_path", "")
+    video_info = data.get("video_info", {})
+    cands = []
+    for d in data.get("candidates", []):
+        cands.append(Candidate(
+            frame_bgr=None,
+            timestamp=float(d["timestamp"]),
+            total_score=float(d["total_score"]),
+            breakdown={k: float(v) for k, v in d.get("breakdown", {}).items()},
+            faces=[tuple(f) for f in d.get("faces", [])],
+            starred=bool(d.get("starred", False)),
+            video_path=video_path,
+        ))
+    return cands, video_path, video_info
