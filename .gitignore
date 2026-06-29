@@ -38,4 +38,5 @@ dist/
 
 # >>> AUTO DISCOVERED RULES >>>
 __pycache__/
+thumbnails/
 # <<< AUTO DISCOVERED RULES <<<
