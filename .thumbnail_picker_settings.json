@@ -1,0 +1,36 @@
+{
+  "badge": {
+    "style_name": "Classic Red",
+    "text": "LIVE",
+    "position": "Top-Right",
+    "custom_x": 0.0,
+    "custom_y": 0.0,
+    "font_size_ratio": 0.045,
+    "padding_h_ratio": 0.02,
+    "padding_v_ratio": 0.013,
+    "margin_ratio": 0.025,
+    "corner_radius": 94,
+    "bg_color": "#e50914",
+    "text_color": "#ffffff",
+    "border_color": null,
+    "border_width": 20,
+    "shadow_enabled": true,
+    "shadow_opacity": 1.0,
+    "shadow_blur": 40,
+    "opacity": 1.0
+  },
+  "output_preset": "Original",
+  "fit_mode": "fit",
+  "active_tab": 0,
+  "window_geometry": {
+    "x": 282,
+    "y": 39,
+    "width": 1300,
+    "height": 1268
+  },
+  "text_overlays": [],
+  "export_quality": 95,
+  "last_open_folder": "",
+  "last_save_folder": "F:\\Videos",
+  "custom_size": null
+}
