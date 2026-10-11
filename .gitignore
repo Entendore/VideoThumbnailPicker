@@ -40,3 +40,30 @@ dist/
 __pycache__/
 thumbnails/
 # <<< AUTO DISCOVERED RULES <<<
+
+# Added by Git Repo Creator
+# Media and Archives
+*.mp4
+*.wav
+*.mp3
+*.mov
+*.mkv
+*.avi
+*.webm
+*.flac
+*.aac
+*.ogg
+*.m4a
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.iso
+*.blend
+# Python / Dev
+.env
+.env.local
+.pytest_cache/
+*.tmp
+*.bak
